@@ -1,0 +1,14 @@
+node_modules
+artifacts
+cache
+.env
+backend/uploads
+backend/endpoints.json
+tmp/
+frontend/dist/
+backend/data.db
+backend/*.db
+backend/**/*.db*
+backend/smoke-*/
+docx_qa/
+*.log

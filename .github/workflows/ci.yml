@@ -1,0 +1,163 @@
+name: Atlas CI/CD
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: atlas-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: 20
+
+jobs:
+  verify:
+    name: Verify application
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+
+      - name: Install backend dependencies
+        run: npm ci
+
+      - name: Test smart contract
+        run: npm test
+
+      - name: Compile smart contract
+        run: npm run compile
+
+      - name: Install frontend dependencies
+        run: npm ci --prefix frontend
+
+      - name: Build frontend
+        run: npm run build --prefix frontend
+
+      - name: Check backend syntax
+        run: node --check backend/server.js
+
+  containers:
+    name: Build Docker images
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.backend
+          push: false
+          tags: atlas-api:ci
+          cache-from: type=gha,scope=atlas-api
+          cache-to: type=gha,mode=max,scope=atlas-api
+
+      - name: Build web image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: false
+          tags: atlas-web:ci
+          build-args: |
+            VITE_API=${{ vars.ATLAS_PUBLIC_API_URL || '' }}
+            VITE_CHAIN_ID=${{ vars.ATLAS_CHAIN_ID || '11155111' }}
+            VITE_INR_PER_ETH=${{ vars.ATLAS_INR_PER_ETH || '0' }}
+          cache-from: type=gha,scope=atlas-web
+          cache-to: type=gha,mode=max,scope=atlas-web
+
+  publish:
+    name: Publish release images
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'))
+    needs: [verify, containers]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Publish API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.backend
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/atlas-api:latest
+            ghcr.io/${{ github.repository_owner }}/atlas-api:sha-${{ github.sha }}
+          cache-from: type=gha,scope=atlas-api
+          cache-to: type=gha,mode=max,scope=atlas-api
+
+      - name: Publish web image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/atlas-web:latest
+            ghcr.io/${{ github.repository_owner }}/atlas-web:sha-${{ github.sha }}
+          build-args: |
+            VITE_API=${{ vars.ATLAS_PUBLIC_API_URL || '' }}
+            VITE_CHAIN_ID=${{ vars.ATLAS_CHAIN_ID || '11155111' }}
+            VITE_INR_PER_ETH=${{ vars.ATLAS_INR_PER_ETH || '0' }}
+          cache-from: type=gha,scope=atlas-web
+          cache-to: type=gha,mode=max,scope=atlas-web
+
+      - name: Deploy to Docker host when configured
+        if: ${{ secrets.DEPLOY_HOST != '' && secrets.DEPLOY_USER != '' && secrets.DEPLOY_PATH != '' && secrets.DEPLOY_SSH_KEY != '' && secrets.GHCR_DEPLOY_TOKEN != '' && secrets.GHCR_DEPLOY_USER != '' }}
+        uses: appleboy/ssh-action@v1.2.2
+        env:
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          GHCR_DEPLOY_USER: ${{ secrets.GHCR_DEPLOY_USER }}
+          GHCR_DEPLOY_TOKEN: ${{ secrets.GHCR_DEPLOY_TOKEN }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: DEPLOY_PATH,GHCR_DEPLOY_USER,GHCR_DEPLOY_TOKEN
+          script_stop: true
+          script: |
+            set -eu
+            cd "$DEPLOY_PATH"
+            echo "$GHCR_DEPLOY_TOKEN" | docker login ghcr.io -u "$GHCR_DEPLOY_USER" --password-stdin
+            docker compose pull api web
+            docker compose up -d --no-build --remove-orphans
+            docker image prune -f
+            docker compose ps
