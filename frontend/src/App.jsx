@@ -146,7 +146,11 @@ function ModelCard({ model, account, owned, onchainOwned, fiatOwned, canChain, a
       if (!selectedName) return; const selected = files.find((file) => file.name === selectedName); if (!selected) throw new Error("Choose one of the listed weight files");
       urlPath = `/api/huggingface/download/${model.id}?file=${encodeURIComponent(selected.name)}`; downloadName = selected.name.split("/").pop();
     }
-    const response = await fetch(`${API}${urlPath}`, { credentials: "include", headers: jsonHeaders(token) }); if (!response.ok) { const result = await response.json().catch(() => ({})); throw new Error(result.error || "Download unavailable"); } const blob = await response.blob(), url = URL.createObjectURL(blob), link = document.createElement("a"); link.href = url; link.download = downloadName; document.body.appendChild(link); link.click(); link.remove(); URL.revokeObjectURL(url);
+    // The session cookie authenticates this navigation. Let the browser stream the
+    // response directly to its download manager instead of buffering large weights
+    // in JavaScript memory as a Blob.
+    const downloadUrl = `${API}${urlPath}`;
+    const link = document.createElement("a"); link.href = downloadUrl; link.download = downloadName; link.rel = "noopener"; document.body.appendChild(link); link.click(); link.remove();
   });
   const configure = (provider) => run(async () => { const body = provider === "huggingface" ? { provider, repo: model.hfRepo } : { provider, url: prompt("Inference endpoint URL (HTTPS required in production)") }; if (!body.url && provider !== "huggingface") return; const response = await post(`/api/endpoint/${model.id}`, token, body); const result = await response.json(); if (!response.ok) throw new Error(result.error); note(provider === "huggingface" ? "GPU-capable Hugging Face inference enabled" : "Creator endpoint saved"); });
   const loadComments = async () => { const response = await fetch(`${API}/api/models/${model.id}/comments`, { credentials: "include" }); const result = await response.json(); if (response.ok) setComments(result.comments || []); setExpanded(true); };

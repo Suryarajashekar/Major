@@ -6,6 +6,7 @@ const rateLimit = require("express-rate-limit"), multer = require("multer");
 const crypto = require("crypto"), fs = require("fs"), path = require("path"), dns = require("dns"), net = require("net");
 const jwt = require("jsonwebtoken"), Database = require("better-sqlite3");
 const { ethers } = require("ethers"), { Agent, fetch: ufetch } = require("undici");
+const { pipeline } = require("stream/promises");
 const { address, abi } = require("./contract.json");
 
 const env = process.env, PROD = env.NODE_ENV === "production";
@@ -396,6 +397,9 @@ const lookup = (host, o, cb) => dns.lookup(host, o, (e, a, f) => {
   cb(null, a, f);
 });
 const agent = new Agent({ connect: { lookup }, headersTimeout: 15000, bodyTimeout: 15000, maxResponseSize: 1e6 });
+// Metadata and API calls remain capped, but model weights can be many gigabytes.
+// Keep a separate dispatcher without maxResponseSize for the streaming download route.
+const downloadAgent = new Agent({ connect: { lookup }, headersTimeout: 30000, bodyTimeout: 120000 });
 function checkUrl(raw) {
   let u; try { u = new URL(raw); } catch { throw new AppError("Invalid URL"); }
   if (u.username || u.password) throw new AppError("Credentials in URLs are not allowed");
@@ -1394,13 +1398,37 @@ app.get("/api/huggingface/download/:id", authed, wrap(async (req, res) => {
   const info = await hfModelInfo(repo), file = hfFiles(info).find((item) => item.name === requested);
   if (!file) throw new AppError("That weight file is not available in the imported repository", 404);
   let upstream;
-  try { upstream = await ufetch(hfResolveUrl(repo, metadata.source.revision, file.name), { dispatcher: agent, redirect: "follow", headers: env.HF_API_TOKEN ? { Authorization: `Bearer ${env.HF_API_TOKEN}` } : {}, signal: AbortSignal.timeout(120000) }); }
+  try {
+    upstream = await ufetch(hfResolveUrl(repo, metadata.source.revision, file.name), {
+      dispatcher: downloadAgent,
+      redirect: "follow",
+      headers: { Accept: "application/octet-stream", "Accept-Encoding": "identity", ...(env.HF_API_TOKEN ? { Authorization: `Bearer ${env.HF_API_TOKEN}` } : {}) },
+      signal: AbortSignal.timeout(120000)
+    });
+  }
   catch (error) { throw new AppError(`Unable to download the upstream weight file: ${error.message}`, 502); }
-  if (!upstream.ok || !upstream.body) throw new AppError(`Hugging Face could not serve that file: HTTP ${upstream.status}`, 502);
+  if (!upstream.ok || !upstream.body) {
+    if ([401, 403].includes(upstream.status)) throw new AppError("Hugging Face rejected this file because the repository is gated or private; configure HF_API_TOKEN on the API server", 502);
+    throw new AppError(`Hugging Face could not serve that file: HTTP ${upstream.status}`, 502);
+  }
   const downloadName = safeEvidenceName(path.basename(file.name));
   res.status(200).set({ "Content-Type": upstream.headers.get("content-type") || "application/octet-stream", "Content-Disposition": `attachment; filename="${downloadName}"`, "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" });
   const length = upstream.headers.get("content-length"); if (length) res.set("Content-Length", length);
-  require("stream").Readable.fromWeb(upstream.body).pipe(res);
+  const source = require("stream").Readable.fromWeb(upstream.body), abort = new AbortController();
+  let finished = false;
+  const cancel = () => { if (!finished) abort.abort(); };
+  req.once("aborted", cancel);
+  res.once("finish", () => { finished = true; });
+  res.once("close", cancel);
+  try {
+    await pipeline(source, res, { signal: abort.signal });
+  } catch (error) {
+    if (!finished && !["ABORT_ERR", "ERR_STREAM_PREMATURE_CLOSE"].includes(error.code)) console.error(JSON.stringify({ level: "error", path: req.path, msg: `Hugging Face download stream failed: ${error.message}` }));
+  } finally {
+    finished = true;
+    req.off("aborted", cancel);
+    res.off("close", cancel);
+  }
 }));
 
 // Download requires: valid session + artifact hash matches the on-chain model + on-chain license
